@@ -1,0 +1,19 @@
+{
+  "name": "modern-ai-wallet-server",
+  "version": "1.0.0",
+  "description": "Backend for MODERN AI Wallet - MarzPay deposit/withdraw with Firebase Firestore balance sync",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "firebase-admin": "^12.1.0",
+    "node-fetch": "^2.7.0",
+    "form-data": "^4.0.0"
+  }
+}
