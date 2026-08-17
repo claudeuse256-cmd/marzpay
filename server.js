@@ -1,9 +1,10 @@
 
-// server.js — MODERN AI Wallet backend (deploy on Render)
-// Host: https://obpaytest.onrender.com
+// server.js — HMK Stocks Wallet backend (deploy on Render)
+// Host: https://marzpay.onrender.com
 //
 // REQUIRED ENVIRONMENT VARIABLES (set these in Render dashboard, never in code):
 //   FIREBASE_SERVICE_ACCOUNT   -> full JSON of your Firebase service account key, as ONE LINE string
+//                                 (must be a service account for the "whealthsphere" Firebase project)
 //   MARZPAY_API_KEY            -> your MarzPay API Key (marz_...)
 //   MARZPAY_API_SECRET         -> your MarzPay API Secret
 //   MARZPAY_BASE_URL           -> https://wallet.wearemarz.com/api/v1
@@ -32,7 +33,7 @@ try {
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://modern-ai-hub-default-rtdb.firebaseio.com"
+  databaseURL: "https://whealthsphere-default-rtdb.firebaseio.com"
 });
 const db = admin.firestore();
 const firebaseReady = true;
@@ -149,8 +150,8 @@ app.post("/api/deposit", requireAuth, async (req, res) => {
       form.append("amount", String(amt));
       form.append("country", "UG");
       form.append("reference", reference);
-      form.append("description", "MODERN AI Wallet deposit");
-      form.append("callback_url", "https://obpaytest.onrender.com/webhook/marzpay");
+      form.append("description", "HMK Stocks Wallet deposit");
+      form.append("callback_url", "https://marzpay.onrender.com/webhook/marzpay");
 
       marzRes = await fetch(`${MARZPAY_BASE_URL}/collect-money`, {
         method: "POST",
@@ -243,8 +244,8 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
     withdrawForm.append("amount", String(amt));
     withdrawForm.append("country", "UG");
     withdrawForm.append("reference", reference);
-    withdrawForm.append("description", "MODERN AI Wallet withdrawal");
-    withdrawForm.append("callback_url", "https://obpaytest.onrender.com/webhook/marzpay");
+    withdrawForm.append("description", "HMK Stocks Wallet withdrawal");
+    withdrawForm.append("callback_url", "https://marzpay.onrender.com/webhook/marzpay");
 
     const marzRes = await fetch(`${MARZPAY_BASE_URL}/send-money`, {
       method: "POST",
@@ -433,6 +434,6 @@ app.post("/api/admin/update-transaction", requireAuth, async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`MODERN AI Wallet server running on port ${PORT}, firebaseReady=${firebaseReady}`);
+  console.log(`HMK Stocks Wallet server running on port ${PORT}, firebaseReady=${firebaseReady}`);
 });
 
