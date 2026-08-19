@@ -199,6 +199,21 @@ const ADMIN_EMAILS = ["srezra4@gmail.com"];
 //      happens to be awake on its own.
 const TX_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+// IMPORTANT: this used to auto-refund withdrawals that were still "pending"
+// after 5 minutes, on the assumption that no webhook after 5 minutes meant
+// the payout never happened. In practice the payout can genuinely succeed
+// on MarzPay's side while the webhook that would tell us so never arrives
+// or arrives in a shape the handler didn't recognize — auto-refunding in
+// that case gives the user their wallet balance back AND the real mobile
+// money payout, a real balance-drift bug, not just a cosmetic one.
+//
+// So withdrawals no longer auto-fail/auto-refund here. Instead, after
+// TX_TIMEOUT_MS a still-pending withdrawal is flipped to "unconfirmed" —
+// a distinct status meaning "we don't know the outcome, don't trust either
+// balance state until a human checks MarzPay's dashboard for this
+// reference and resolves it via POST /api/admin/update-transaction."
+// Deposits are unaffected by this change: nothing was ever credited for a
+// still-pending deposit, so marking it "failed" here has no balance risk.
 async function expireIfStale(txRef) {
   return db.runTransaction(async (t) => {
     const snap = await t.get(txRef);
@@ -211,19 +226,27 @@ async function expireIfStale(txRef) {
     const ageMs = Date.now() - createdMs;
     if (!createdMs || ageMs < TX_TIMEOUT_MS) return tx; // not stale yet
 
+    if (tx.type === "withdraw") {
+      // Do NOT touch balance here — we genuinely don't know whether the
+      // payout succeeded. Flag for manual/admin resolution instead.
+      const updated = {
+        status: "unconfirmed",
+        failReason: "No webhook confirmation received within 5 minutes. This does NOT mean the transfer failed — MarzPay payouts can succeed without a webhook arriving. Support will verify with MarzPay directly and resolve this manually.",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      t.update(txRef, updated);
+      console.warn(`Withdrawal ${tx.reference} timed out waiting for webhook — marked unconfirmed, NOT auto-refunded. Needs manual review.`);
+      return { ...tx, ...updated, status: "unconfirmed" };
+    }
+
+    // Deposits: nothing was ever credited while pending, so it's safe to
+    // resolve this as failed outright — no balance to reverse.
     const updated = {
       status: "failed",
       failReason: "Timed out waiting for network confirmation (5 min). If money was already sent, contact support before retrying.",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
-
-    if (tx.type === "withdraw") {
-      // Refund the reserved balance since the payout never confirmed.
-      const userRef = db.collection("users").doc(tx.uid);
-      t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
-    }
     t.update(txRef, updated);
-
     return { ...tx, ...updated, status: "failed" };
   });
 }
@@ -514,8 +537,9 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
 // ---------- TRANSACTION STATUS (polled by wallet.html) ----------
 // The client polls this every few seconds after submitting a deposit/withdraw
 // in automatic mode. This is also where stale "pending" transactions actually
-// get expired to "failed" — see expireIfStale() above for why that lives here
-// rather than only in a background timer.
+// get resolved — see expireIfStale() above. Deposits resolve to "failed";
+// withdrawals resolve to "unconfirmed" (never auto-refunded, since the
+// payout can genuinely have succeeded even without a webhook arriving).
 app.get("/api/transaction/:reference/status", requireAuth, async (req, res) => {
   try {
     const { reference } = req.params;
@@ -604,23 +628,77 @@ function verifyMarzPaySignature(req) {
   return valid ? { ok: true, checked: true } : { ok: false, checked: true, reason: "Signature mismatch." };
 }
 
-app.post("/webhook/marzpay", async (req, res) => {
+// ---------- Webhook diagnostic logging ----------
+// Every call to /webhook/marzpay is recorded here VERBATIM — regardless of
+// whether it was recognized, matched a transaction, or passed signature
+// verification — so you can see exactly what MarzPay actually sent after a
+// real withdrawal, instead of guessing at their payload shape. This is the
+// single most useful tool for diagnosing "money arrived but stayed Pending":
+// check GET /api/admin/webhook-logs (below) right after your next withdrawal.
+async function logWebhookCall(entry) {
   try {
-    const verification = verifyMarzPaySignature(req);
+    await db.collection("webhookLogs").add({
+      ...entry,
+      receivedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (e) {
+    console.error("Failed to log webhook call:", e.message);
+  }
+}
+
+// Pull a value out of the payload trying every key shape MarzPay (or any
+// similarly-structured provider) plausibly uses, since payload shape can
+// differ from what we originally coded against. Checked in order; first
+// match wins.
+function pluckFirst(obj, paths) {
+  for (const path of paths) {
+    const val = path.split(".").reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
+    if (val !== undefined && val !== null && val !== "") return val;
+  }
+  return undefined;
+}
+
+app.post("/webhook/marzpay", async (req, res) => {
+  const verification = verifyMarzPaySignature(req);
+
+  // Log the raw call FIRST, before any other processing can throw and skip
+  // it — an unrecognized or rejected payload is exactly the case we most
+  // need a record of.
+  await logWebhookCall({
+    signatureOk: verification.ok,
+    signatureChecked: verification.checked,
+    signatureReason: verification.reason || null,
+    headers: {
+      "x-marzpay-timestamp": req.headers["x-marzpay-timestamp"] || null,
+      "x-marzpay-signature": req.headers["x-marzpay-signature"] || null,
+      "content-type": req.headers["content-type"] || null
+    },
+    rawBody: req.rawBody || null,
+    body: req.body || null
+  });
+
+  try {
     if (!verification.ok) {
       console.warn("Rejected MarzPay webhook: " + verification.reason);
       return res.status(401).json({ success: false, error: "Invalid webhook signature." });
     }
 
-    // MarzPay's webhook payload nests everything under `transaction`, e.g.:
-    // { "event_type": "collection.completed", "transaction": { "reference": "...", "status": "completed" }, "collection": {...} }
-    const eventType = req.body.event_type;
-    const transaction = req.body.transaction || {};
-    const reference = transaction.reference;
-    const status = transaction.status;
+    // Shape-tolerant extraction. MarzPay's documented shape nests everything
+    // under `transaction` (e.g. transaction.reference, transaction.status),
+    // but we also check top-level and `data`-wrapped variants as a fallback
+    // in case the real payload differs from what we coded against — this is
+    // exactly the kind of mismatch that leaves a transaction stuck pending
+    // even though the payout genuinely succeeded.
+    const eventType = pluckFirst(req.body, ["event_type", "event", "type"]);
+    const reference = pluckFirst(req.body, [
+      "transaction.reference", "reference", "data.reference", "data.transaction.reference"
+    ]);
+    const status = pluckFirst(req.body, [
+      "transaction.status", "status", "data.status", "data.transaction.status"
+    ]);
 
     if (!reference) {
-      console.warn("Webhook missing transaction.reference. Full body:", JSON.stringify(req.body));
+      console.warn("Webhook missing reference in any known shape. Full body:", JSON.stringify(req.body));
       return res.status(400).json({ success: false, error: "Missing reference." });
     }
 
@@ -639,12 +717,18 @@ app.post("/webhook/marzpay", async (req, res) => {
     }
 
     // Prefer event_type (collection.completed / collection.failed / disbursement.completed / disbursement.failed)
-    // since MarzPay documents this as the authoritative "final status" signal; fall back to transaction.status.
+    // since MarzPay documents this as the authoritative "final status" signal; fall back to status field.
+    // Widened to cover more synonyms a webhook payload could plausibly use —
+    // this is intentionally broad since the cost of missing a real success
+    // (leaving it "pending" forever) is worse than the cost of a slightly
+    // over-inclusive match.
     const normalizedEvent = String(eventType || "").toLowerCase();
-    const normalizedStatus = String(status || "").toLowerCase();
-    const isSuccess = normalizedEvent.endsWith(".completed") || normalizedStatus === "completed" || normalizedStatus === "successful";
+    const normalizedStatus = String(status || "").toLowerCase().trim();
+    const successStatuses = ["completed", "complete", "successful", "success", "paid", "confirmed"];
+    const failStatuses = ["failed", "failure", "cancelled", "canceled", "rejected", "declined", "expired"];
+    const isSuccess = normalizedEvent.endsWith(".completed") || successStatuses.includes(normalizedStatus);
     const isFailed = normalizedEvent.endsWith(".failed") || normalizedEvent.endsWith(".cancelled")
-      || normalizedStatus === "failed" || normalizedStatus === "cancelled";
+      || failStatuses.includes(normalizedStatus);
 
     const userRef = db.collection("users").doc(tx.uid);
 
@@ -660,6 +744,7 @@ app.post("/webhook/marzpay", async (req, res) => {
           webhookPayload: req.body
         });
       });
+      console.log(`Webhook: marked ${reference} completed (event=${normalizedEvent || "n/a"}, status=${normalizedStatus || "n/a"})`);
     } else if (isFailed) {
       await db.runTransaction(async (t) => {
         if (tx.type === "withdraw") {
@@ -672,12 +757,17 @@ app.post("/webhook/marzpay", async (req, res) => {
           webhookPayload: req.body
         });
       });
+      console.log(`Webhook: marked ${reference} failed (event=${normalizedEvent || "n/a"}, status=${normalizedStatus || "n/a"})`);
     } else {
-      // Unrecognized status — log and leave pending for manual review
+      // Unrecognized status — log and leave pending for manual review.
+      // Check webhookLogs / this transaction's `note` field to see the
+      // exact event_type/status MarzPay actually sent, then add it to
+      // successStatuses/failStatuses above once confirmed.
+      console.warn(`Webhook: unrecognized status for ${reference}: event=${normalizedEvent || "n/a"} status=${normalizedStatus || "n/a"}`);
       await txDoc.ref.update({
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         webhookPayload: req.body,
-        note: "Unrecognized webhook status: " + status
+        note: `Unrecognized webhook status: event_type=${eventType || "n/a"} status=${status || "n/a"}`
       });
     }
 
@@ -685,6 +775,25 @@ app.post("/webhook/marzpay", async (req, res) => {
   } catch (err) {
     console.error("Webhook error:", err);
     res.status(500).json({ success: false, error: "Webhook processing error." });
+  }
+});
+
+// ---------- Admin: view recent webhook deliveries (diagnostic) ----------
+// Visit this after a real withdrawal to see exactly what MarzPay sent,
+// whether the signature check passed, and whether it matched a transaction.
+// Requires an admin-email Firebase session (same check as update-transaction).
+app.get("/api/admin/webhook-logs", requireAuth, async (req, res) => {
+  try {
+    if (!ADMIN_EMAILS.includes((req.userEmail || "").toLowerCase())) {
+      return res.status(403).json({ success: false, error: "Not authorized." });
+    }
+    const limit = Math.min(50, parseInt(req.query.limit, 10) || 20);
+    const snap = await db.collection("webhookLogs").orderBy("receivedAt", "desc").limit(limit).get();
+    const logs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    res.json({ success: true, logs });
+  } catch (err) {
+    console.error("webhook-logs error:", err);
+    res.status(500).json({ success: false, error: "Server error while fetching webhook logs." });
   }
 });
 
@@ -696,7 +805,7 @@ app.post("/api/admin/update-transaction", requireAuth, async (req, res) => {
       return res.status(403).json({ success: false, error: "Not authorized." });
     }
     const { transactionId, newStatus } = req.body;
-    if (!transactionId || !["completed", "failed", "pending"].includes(newStatus)) {
+    if (!transactionId || !["completed", "failed", "pending", "unconfirmed"].includes(newStatus)) {
       return res.status(400).json({ success: false, error: "Invalid input." });
     }
 
