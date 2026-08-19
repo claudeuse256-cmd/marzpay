@@ -115,6 +115,16 @@ function isValidAmount(amount) {
   return typeof amount === "number" && isFinite(amount) && amount >= 500;
 }
 
+// Withdrawal service fee. MarzPay's send-money call is made for the NET
+// amount (after fee) — the user's wallet balance is still debited the FULL
+// amount they asked to withdraw, and the fee difference simply isn't sent out.
+const WITHDRAW_FEE_RATE = 0.08;
+function computeWithdrawSplit(amount) {
+  const fee = Math.round(amount * WITHDRAW_FEE_RATE * 100) / 100;
+  const netAmount = Math.round((amount - fee) * 100) / 100;
+  return { fee, netAmount };
+}
+
 // Emails allowed to call admin-only endpoints (status polling for any user's
 // transaction, manual transaction overrides).
 const ADMIN_EMAILS = ["srezra4@gmail.com"];
@@ -170,6 +180,65 @@ async function expireIfStale(txRef) {
     return { ...tx, ...updated, status: "failed" };
   });
 }
+
+// ---------- ACCOUNT NAME VERIFICATION ----------
+// Before a withdrawal is submitted, the client calls this to ask MarzPay who
+// a phone number is actually registered to (KYC-style phone verification).
+// The user then confirms on-screen that the returned name is really theirs
+// before the withdrawal proceeds. This never touches balance or Firestore —
+// it's a pure lookup — so it's safe to call as many times as needed.
+app.post("/api/verify-account-name", requireAuth, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    const cleanPhone = normalizePhone(phone);
+    if (!cleanPhone) {
+      return res.status(400).json({ success: false, error: "Enter a valid Uganda phone number." });
+    }
+
+    // MarzPay's phone-verification endpoint wants the number WITHOUT the
+    // leading "+" (format: 256XXXXXXXXX), unlike collect-money/send-money
+    // which want the "+256..." form.
+    const lookupPhone = cleanPhone.replace(/^\+/, "");
+
+    let marzRes;
+    try {
+      marzRes = await fetch(`${MARZPAY_BASE_URL}/phone-verification/verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": marzAuthHeader()
+        },
+        body: JSON.stringify({ phone_number: lookupPhone })
+      });
+    } catch (fetchErr) {
+      console.error("Network error calling MarzPay phone-verification:", fetchErr.message);
+      return res.status(502).json({ success: false, error: "Could not reach the verification service. Try again." });
+    }
+
+    const marzData = await marzRes.json().catch(() => ({}));
+
+    if (!marzRes.ok || !marzData.success) {
+      const msg = marzData.message || "This number is not registered on mobile money, or could not be verified.";
+      return res.status(marzRes.status === 404 ? 404 : 400).json({ success: false, error: msg });
+    }
+
+    const info = marzData.data || {};
+    if (!info.full_name) {
+      return res.status(404).json({ success: false, error: "Could not retrieve a registered name for this number." });
+    }
+
+    res.json({
+      success: true,
+      phone: cleanPhone,
+      fullName: info.full_name,
+      firstName: info.first_name || null,
+      lastName: info.last_name || null
+    });
+  } catch (err) {
+    console.error("verify-account-name error:", err);
+    res.status(500).json({ success: false, error: "Server error while verifying account name." });
+  }
+});
 
 // ---------- DEPOSIT ----------
 // User calls this from wallet.html. We create a pending transaction in Firestore,
@@ -261,7 +330,7 @@ app.post("/api/deposit", requireAuth, async (req, res) => {
 // payout, the webhook refunds the reserved amount back to the user.
 app.post("/api/withdraw", requireAuth, async (req, res) => {
   try {
-    const { phone, amount } = req.body;
+    const { phone, amount, verifiedName } = req.body;
     const cleanPhone = normalizePhone(phone);
     const amt = Number(amount);
 
@@ -269,11 +338,53 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Valid phone and amount (min 500 UGX) are required." });
     }
 
+    // Require that the client actually ran /api/verify-account-name for this
+    // exact phone number first and the user confirmed the returned name.
+    // This re-verifies server-side rather than trusting the client's word —
+    // we look the number up again and compare, so a tampered client request
+    // can't skip the check.
+    let verification;
+    try {
+      const lookupPhone = cleanPhone.replace(/^\+/, "");
+      const verifyRes = await fetch(`${MARZPAY_BASE_URL}/phone-verification/verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": marzAuthHeader()
+        },
+        body: JSON.stringify({ phone_number: lookupPhone })
+      });
+      verification = await verifyRes.json().catch(() => ({}));
+      if (!verifyRes.ok || !verification.success || !verification.data || !verification.data.full_name) {
+        return res.status(400).json({
+          success: false,
+          error: verification.message || "Could not verify this account name. Please re-verify and try again."
+        });
+      }
+    } catch (verifyErr) {
+      console.error("Withdraw name re-verification network error:", verifyErr.message);
+      return res.status(502).json({ success: false, error: "Could not reach the verification service. Try again." });
+    }
+
+    const registeredName = verification.data.full_name;
+    const claimedName = String(verifiedName || "").trim();
+    if (!claimedName || claimedName.toLowerCase() !== registeredName.toLowerCase()) {
+      return res.status(400).json({
+        success: false,
+        error: `Name mismatch. This number is registered to "${registeredName}". Please re-verify before withdrawing.`
+      });
+    }
+
+    const { fee, netAmount } = computeWithdrawSplit(amt);
+
     const userRef = db.collection("users").doc(req.uid);
     const txRef = db.collection("transactions").doc();
     const reference = randomUUID(); // MarzPay requires a valid UUID v4 reference
 
-    // Transaction-safe balance check + reservation
+    // Transaction-safe balance check + reservation.
+    // NOTE: the FULL amount (amt) is deducted from the user's balance — the
+    // 8% fee is not sent out, only netAmount is, but the user still pays the
+    // full amount out of their wallet.
     await db.runTransaction(async (t) => {
       const userDoc = await t.get(userRef);
       if (!userDoc.exists) throw new Error("User account not found.");
@@ -287,7 +398,10 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
         uid: req.uid,
         type: "withdraw",
         amount: amt,
+        fee,
+        netAmount,
         phone: cleanPhone,
+        accountName: registeredName,
         status: "pending",
         reference,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -297,7 +411,7 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
 
     const withdrawForm = new FormData();
     withdrawForm.append("phone_number", cleanPhone);
-    withdrawForm.append("amount", String(amt));
+    withdrawForm.append("amount", String(netAmount)); // send only the NET amount after fee
     withdrawForm.append("country", "UG");
     withdrawForm.append("reference", reference);
     withdrawForm.append("description", "HMK Stocks Wallet withdrawal");
@@ -336,7 +450,14 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ success: true, reference, message: "Withdrawal submitted for processing." });
+    res.json({
+      success: true,
+      reference,
+      amount: amt,
+      fee,
+      netAmount,
+      message: `Withdrawal submitted for processing. You will receive UGX ${netAmount.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} after the 8% service fee.`
+    });
   } catch (err) {
     console.error("Withdraw error:", err);
     res.status(400).json({ success: false, error: err.message || "Server error while processing withdrawal." });
@@ -378,6 +499,8 @@ app.get("/api/transaction/:reference/status", requireAuth, async (req, res) => {
       status: tx.status,
       type: tx.type,
       amount: tx.amount,
+      fee: typeof tx.fee === "number" ? tx.fee : null,
+      netAmount: typeof tx.netAmount === "number" ? tx.netAmount : null,
       failReason: tx.failReason || null
     });
   } catch (err) {
