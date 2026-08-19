@@ -85,6 +85,28 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, firebaseReady, time: new Date().toISOString() });
 });
 
+// ---------- DIAGNOSTIC: outbound IP checker ----------
+// Visit this in a browser to see the exact IP address THIS Render instance
+// is currently using for outbound requests (the one that needs to be
+// whitelisted in MarzPay's dashboard). Render's outbound IP is a shared
+// range, not a single fixed address, so this can change between deploys or
+// over time — re-check here any time withdrawals start failing again with
+// an IP-whitelist error, rather than assuming the old IP is still correct.
+app.get("/api/my-outbound-ip", async (req, res) => {
+  try {
+    const ipRes = await fetch("https://api.ipify.org?format=json");
+    const ipData = await ipRes.json();
+    res.json({
+      success: true,
+      outboundIp: ipData.ip,
+      note: "This is the IP this Render instance is currently using for outbound calls (e.g. to MarzPay). Whitelist this exact IP in MarzPay Dashboard > IP Whitelist. Re-check this endpoint if withdrawals start failing again, since Render's shared IP pool can change it."
+    });
+  } catch (err) {
+    console.error("my-outbound-ip check failed:", err.message);
+    res.status(502).json({ success: false, error: "Could not determine outbound IP right now. Try again in a moment." });
+  }
+});
+
 // ---------- Auth middleware: verifies the Firebase ID token from the wallet page ----------
 async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || "";
