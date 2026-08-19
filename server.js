@@ -8,7 +8,13 @@
 //   MARZPAY_API_KEY            -> your MarzPay API Key (marz_...)
 //   MARZPAY_API_SECRET         -> your MarzPay API Secret
 //   MARZPAY_BASE_URL           -> https://wallet.wearemarz.com/api/v1
-//   WEBHOOK_SECRET              -> a random string you choose, used to verify MarzPay webhook calls (optional but recommended)
+//   WEBHOOK_SECRET              -> (legacy, unused) previously a guessed header scheme; replaced by
+//                                  MARZPAY_WEBHOOK_SIGNING_SECRET below, which matches MarzPay's real docs
+//   MARZPAY_WEBHOOK_SIGNING_SECRET -> optional. Enables verifying that /webhook/marzpay calls genuinely
+//                                  came from MarzPay. Get this value from MarzPay Dashboard >
+//                                  Business Settings > Webhooks & Security > "Sign outgoing webhooks" >
+//                                  Reveal > Copy. If unset, webhooks are accepted unsigned (MarzPay's
+//                                  default), which still works but skips this integrity check.
 //   PORT                        -> Render sets this automatically
 
 const express = require("express");
@@ -16,7 +22,8 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
 const FormData = require("form-data");
-const { randomUUID } = require("crypto");
+const crypto = require("crypto");
+const { randomUUID } = crypto;
 
 // ---------- Firebase Admin init ----------
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -68,7 +75,15 @@ function marzAuthHeader() {
 // ---------- App setup ----------
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Capture the raw request body alongside the parsed JSON. MarzPay's webhook
+// signature is computed over the exact raw body bytes — verifying against a
+// re-serialized JSON.stringify(req.body) would fail whenever whitespace or
+// key order differs from what MarzPay actually sent, even with the correct
+// secret. This applies to all routes (cheap to do), but only /webhook/marzpay
+// actually uses req.rawBody.
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); }
+}));
 
 // Temporary: log every incoming request so we can confirm requests are
 // actually reaching the server (helpful while debugging deposit/withdraw issues).
@@ -165,6 +180,16 @@ const ADMIN_EMAILS = ["srezra4@gmail.com"];
 // "failed", the webhook's existing guard (`tx.status !== "pending"`) makes
 // any later, late-arriving webhook call a no-op — so it can never re-credit.
 //
+// TX_TIMEOUT_MS must be generous. If it's too short, a withdrawal that is
+// still genuinely in flight with MarzPay gets marked "failed" and refunded
+// here BEFORE MarzPay's real "completed" webhook arrives — the user then
+// sees "failed"/"timeout" and gets their wallet balance back, even though
+// the mobile money payout actually succeeded and landed on their phone.
+// That's a real balance-drift bug (wallet refund + real money both
+// received), not just a cosmetic timing issue, so err on the side of
+// waiting longer rather than failing fast. 5 minutes comfortably covers
+// normal MTN/Airtel confirmation times.
+//
 // This runs from two places, and both share this one function so there is
 // never a double-refund race between them:
 //   1. GET /api/transaction/:reference/status — checked every time the
@@ -172,7 +197,7 @@ const ADMIN_EMAILS = ["srezra4@gmail.com"];
 //      asleep the whole time and only just woke up to serve the poll.
 //   2. A setInterval sweep below, as a backstop for whenever the instance
 //      happens to be awake on its own.
-const TX_TIMEOUT_MS = 60 * 1000; // 60 seconds
+const TX_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 async function expireIfStale(txRef) {
   return db.runTransaction(async (t) => {
@@ -188,7 +213,7 @@ async function expireIfStale(txRef) {
 
     const updated = {
       status: "failed",
-      failReason: "Timed out waiting for network confirmation (60s).",
+      failReason: "Timed out waiting for network confirmation (5 min). If money was already sent, contact support before retrying.",
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
@@ -534,15 +559,57 @@ app.get("/api/transaction/:reference/status", requireAuth, async (req, res) => {
 // ---------- MARZPAY WEBHOOK ----------
 // MarzPay calls this URL when a deposit or withdrawal finishes processing.
 // This is the ONLY place a user's balance is credited for a deposit.
+//
+// Signature verification (per MarzPay's docs: wallet.wearemarz.com/documentation/webhooks):
+//   - Only active if MARZPAY_WEBHOOK_SIGNING_SECRET is set. MarzPay's webhook
+//     signing is OPT-IN — you turn it on in Business Settings > Webhooks &
+//     Security, click Reveal, and copy that secret into this env var. Without
+//     it, MarzPay sends plain unsigned JSON and this check is skipped (not
+//     recommended for production, but matches their default behavior).
+//   - Headers: X-MarzPay-Timestamp (unix seconds) and X-MarzPay-Signature,
+//     formatted as "t={timestamp},v1={hex_signature}".
+//   - Signature = HMAC-SHA256("{timestamp}.{raw_body}", signing_secret),
+//     compared against the v1 hex value using a constant-time check.
+//   - MUST use the raw request body bytes (req.rawBody, captured by the
+//     express.json() verify hook above) — hashing JSON.stringify(req.body)
+//     instead would silently fail on any whitespace/key-order difference,
+//     even with the right secret.
+function verifyMarzPaySignature(req) {
+  const signingSecret = process.env.MARZPAY_WEBHOOK_SIGNING_SECRET;
+  if (!signingSecret) return { ok: true, checked: false }; // signing not enabled — nothing to verify
+
+  const timestamp = req.headers["x-marzpay-timestamp"];
+  const signatureHeader = req.headers["x-marzpay-signature"];
+  const rawBody = req.rawBody || "";
+
+  if (!timestamp || !signatureHeader) {
+    return { ok: false, checked: true, reason: "Missing signature headers." };
+  }
+
+  const match = /v1=([a-f0-9]+)/.exec(signatureHeader);
+  const received = match ? match[1] : "";
+  if (!received) {
+    return { ok: false, checked: true, reason: "Malformed X-MarzPay-Signature header." };
+  }
+
+  const expected = crypto
+    .createHmac("sha256", signingSecret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest("hex");
+
+  const expectedBuf = Buffer.from(expected, "utf8");
+  const receivedBuf = Buffer.from(received, "utf8");
+  const valid = expectedBuf.length === receivedBuf.length && crypto.timingSafeEqual(expectedBuf, receivedBuf);
+
+  return valid ? { ok: true, checked: true } : { ok: false, checked: true, reason: "Signature mismatch." };
+}
+
 app.post("/webhook/marzpay", async (req, res) => {
   try {
-    // Optional shared-secret check if you configure WEBHOOK_SECRET in Render
-    // and MarzPay supports a signing header — adjust header name to match their docs.
-    if (process.env.WEBHOOK_SECRET) {
-      const incomingSecret = req.headers["x-webhook-secret"];
-      if (incomingSecret !== process.env.WEBHOOK_SECRET) {
-        return res.status(401).json({ success: false, error: "Invalid webhook secret." });
-      }
+    const verification = verifyMarzPaySignature(req);
+    if (!verification.ok) {
+      console.warn("Rejected MarzPay webhook: " + verification.reason);
+      return res.status(401).json({ success: false, error: "Invalid webhook signature." });
     }
 
     // MarzPay's webhook payload nests everything under `transaction`, e.g.:
