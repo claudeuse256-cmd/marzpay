@@ -115,6 +115,62 @@ function isValidAmount(amount) {
   return typeof amount === "number" && isFinite(amount) && amount >= 500;
 }
 
+// Emails allowed to call admin-only endpoints (status polling for any user's
+// transaction, manual transaction overrides).
+const ADMIN_EMAILS = ["srezra4@gmail.com"];
+
+// ---------- Stale-transaction expiry ----------
+// If MarzPay never calls our webhook (dropped callback, user never approved,
+// etc.) a transaction can sit at status "pending" forever. That's dangerous:
+// if MarzPay *later* delivers a delayed/retried webhook call for it, the
+// webhook's only guard against double-crediting is `tx.status !== "pending"`.
+// So a transaction the user already saw as "failed" client-side, but which
+// server-side was still silently "pending", could get credited a second time
+// whenever that late webhook finally arrives.
+//
+// Fix: after TX_TIMEOUT_MS with no resolution, we proactively flip the
+// transaction to "failed" ourselves (refunding withdrawals). Once it's
+// "failed", the webhook's existing guard (`tx.status !== "pending"`) makes
+// any later, late-arriving webhook call a no-op — so it can never re-credit.
+//
+// This runs from two places, and both share this one function so there is
+// never a double-refund race between them:
+//   1. GET /api/transaction/:reference/status — checked every time the
+//      client polls, so expiry is enforced even if this Render instance was
+//      asleep the whole time and only just woke up to serve the poll.
+//   2. A setInterval sweep below, as a backstop for whenever the instance
+//      happens to be awake on its own.
+const TX_TIMEOUT_MS = 60 * 1000; // 60 seconds
+
+async function expireIfStale(txRef) {
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(txRef);
+    if (!snap.exists) return null;
+    const tx = snap.data();
+
+    if (tx.status !== "pending") return tx; // already resolved, nothing to do
+
+    const createdMs = tx.createdAt && tx.createdAt.toMillis ? tx.createdAt.toMillis() : 0;
+    const ageMs = Date.now() - createdMs;
+    if (!createdMs || ageMs < TX_TIMEOUT_MS) return tx; // not stale yet
+
+    const updated = {
+      status: "failed",
+      failReason: "Timed out waiting for network confirmation (60s).",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (tx.type === "withdraw") {
+      // Refund the reserved balance since the payout never confirmed.
+      const userRef = db.collection("users").doc(tx.uid);
+      t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
+    }
+    t.update(txRef, updated);
+
+    return { ...tx, ...updated, status: "failed" };
+  });
+}
+
 // ---------- DEPOSIT ----------
 // User calls this from wallet.html. We create a pending transaction in Firestore,
 // then call MarzPay collect-money. Balance is only credited once MarzPay confirms
@@ -287,6 +343,49 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
   }
 });
 
+// ---------- TRANSACTION STATUS (polled by wallet.html) ----------
+// The client polls this every few seconds after submitting a deposit/withdraw
+// in automatic mode. This is also where stale "pending" transactions actually
+// get expired to "failed" — see expireIfStale() above for why that lives here
+// rather than only in a background timer.
+app.get("/api/transaction/:reference/status", requireAuth, async (req, res) => {
+  try {
+    const { reference } = req.params;
+    if (!reference) {
+      return res.status(400).json({ success: false, error: "Missing reference." });
+    }
+
+    const txSnap = await db.collection("transactions").where("reference", "==", reference).limit(1).get();
+    if (txSnap.empty) {
+      return res.status(404).json({ success: false, error: "Transaction not found." });
+    }
+
+    const txDoc = txSnap.docs[0];
+    let tx = txDoc.data();
+
+    // Only the owner of the transaction (or an admin) may poll its status.
+    if (tx.uid !== req.uid && !ADMIN_EMAILS.includes((req.userEmail || "").toLowerCase())) {
+      return res.status(403).json({ success: false, error: "Not authorized." });
+    }
+
+    if (tx.status === "pending") {
+      const resolved = await expireIfStale(txDoc.ref);
+      if (resolved) tx = resolved;
+    }
+
+    res.json({
+      success: true,
+      status: tx.status,
+      type: tx.type,
+      amount: tx.amount,
+      failReason: tx.failReason || null
+    });
+  } catch (err) {
+    console.error("Transaction status error:", err);
+    res.status(500).json({ success: false, error: "Server error while checking transaction status." });
+  }
+});
+
 // ---------- MARZPAY WEBHOOK ----------
 // MarzPay calls this URL when a deposit or withdrawal finishes processing.
 // This is the ONLY place a user's balance is credited for a deposit.
@@ -379,8 +478,6 @@ app.post("/webhook/marzpay", async (req, res) => {
 
 // ---------- Admin: manual transaction status override (optional utility) ----------
 // Protects itself by requiring the caller's Firebase token to match an admin email.
-const ADMIN_EMAILS = ["srezra4@gmail.com"];
-
 app.post("/api/admin/update-transaction", requireAuth, async (req, res) => {
   try {
     if (!ADMIN_EMAILS.includes((req.userEmail || "").toLowerCase())) {
@@ -431,6 +528,38 @@ app.post("/api/admin/update-transaction", requireAuth, async (req, res) => {
     res.status(500).json({ success: false, error: "Server error." });
   }
 });
+
+// ---------- Background sweep for stale pending transactions ----------
+// Backstop only. On Render's free tier this instance sleeps when idle, so
+// this interval will NOT catch everything on its own — the real safety net
+// is expireIfStale() being called from GET /api/transaction/:reference/status
+// every time the client polls (see above). This sweep just cleans things up
+// promptly whenever the server happens to be awake, so pending transactions
+// don't visibly linger in a user's history longer than necessary.
+// NOTE: the query below (status == "pending" AND createdAt <= cutoff) needs a
+// Firestore composite index on the "transactions" collection. The first time
+// this runs, Firestore will log an error to Render's console containing a
+// direct link to auto-create that index — open it once and click "Create".
+// Until that index exists, this sweep will fail silently (caught below) and
+// do nothing; it's a backstop, so the status-poll expiry still protects you.
+const SWEEP_INTERVAL_MS = 30 * 1000;
+async function sweepStalePending() {
+  try {
+    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - TX_TIMEOUT_MS);
+    const staleSnap = await db.collection("transactions")
+      .where("status", "==", "pending")
+      .where("createdAt", "<=", cutoff)
+      .limit(25)
+      .get();
+    for (const doc of staleSnap.docs) {
+      await expireIfStale(doc.ref);
+    }
+  } catch (e) {
+    // Don't let a sweep failure crash the server; just log and try again next tick.
+    console.warn("Stale-transaction sweep error:", e.message);
+  }
+}
+setInterval(sweepStalePending, SWEEP_INTERVAL_MS);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
