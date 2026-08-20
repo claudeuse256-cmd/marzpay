@@ -455,14 +455,23 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
     // NOTE: the FULL amount (amt) is deducted from the user's balance — the
     // 8% fee is not sent out, only netAmount is, but the user still pays the
     // full amount out of their wallet.
+    // balance is stored as a map ({betting, earning, main, ...}) — main is
+    // the spendable/withdrawable balance. Reading/writing the top-level
+    // "balance" field as a number was silently broken: Number(<object>)
+    // is NaN, so the insufficient-balance check never actually blocked
+    // anything, and increment() on a map field doesn't do what a flat
+    // numeric increment would.
     await db.runTransaction(async (t) => {
       const userDoc = await t.get(userRef);
       if (!userDoc.exists) throw new Error("User account not found.");
-      const balance = Number(userDoc.data().balance || 0);
+      const rawBalance = userDoc.data().balance;
+      const balance = (rawBalance && typeof rawBalance === "object")
+        ? Number(rawBalance.main || 0)
+        : Number(rawBalance || 0);
       if (balance < amt) throw new Error("Insufficient balance.");
 
       t.update(userRef, {
-        balance: admin.firestore.FieldValue.increment(-amt)
+        "balance.main": admin.firestore.FieldValue.increment(-amt)
       });
       t.set(txRef, {
         uid: req.uid,
@@ -502,7 +511,7 @@ app.post("/api/withdraw", requireAuth, async (req, res) => {
       console.error("MarzPay send-money failed:", marzRes.status, JSON.stringify(marzData));
       // Refund the reserved balance since the payout call itself failed
       await db.runTransaction(async (t) => {
-        t.update(userRef, { balance: admin.firestore.FieldValue.increment(amt) });
+        t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(amt) });
         t.update(txRef, {
           status: "failed",
           failReason: marzData.message || `MarzPay error (HTTP ${marzRes.status})`,
@@ -735,7 +744,7 @@ app.post("/webhook/marzpay", async (req, res) => {
     if (isSuccess) {
       await db.runTransaction(async (t) => {
         if (tx.type === "deposit") {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(tx.amount) });
         }
         // For withdrawals, balance was already deducted at request time — nothing more to do.
         t.update(txDoc.ref, {
@@ -749,7 +758,7 @@ app.post("/webhook/marzpay", async (req, res) => {
       await db.runTransaction(async (t) => {
         if (tx.type === "withdraw") {
           // Refund reserved balance back to user since payout failed
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(tx.amount) });
         }
         t.update(txDoc.ref, {
           status: "failed",
@@ -825,19 +834,19 @@ app.post("/api/admin/update-transaction", requireAuth, async (req, res) => {
       // balances stay consistent no matter what transition the admin makes.
       if (tx.type === "deposit") {
         if (tx.status === "completed" && newStatus !== "completed") {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(-tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(-tx.amount) });
         }
         if (tx.status !== "completed" && newStatus === "completed") {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(tx.amount) });
         }
       }
       if (tx.type === "withdraw") {
         // withdraw amount is deducted at request time; "failed" means refunded
         if (tx.status !== "failed" && newStatus === "failed") {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(tx.amount) });
         }
         if (tx.status === "failed" && newStatus !== "failed") {
-          t.update(userRef, { balance: admin.firestore.FieldValue.increment(-tx.amount) });
+          t.update(userRef, { "balance.main": admin.firestore.FieldValue.increment(-tx.amount) });
         }
       }
       t.update(txRef, { status: newStatus, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
