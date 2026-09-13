@@ -1,4 +1,3 @@
-
 // server.js — HMK Stocks Wallet backend (deploy on Render)
 // Host: https://marzpay.onrender.com
 //
@@ -394,6 +393,109 @@ app.post("/api/deposit", requireAuth, async (req, res) => {
   }
 });
 
+// ---------- CARD DEPOSIT ----------
+// Same idea as /api/deposit above, but for MarzPay's card-payment flow
+// instead of mobile money:
+//   - No phone number — card collections use `method: "card"` and a JSON
+//     body (not the multipart form mobile money needs).
+//   - MarzPay does not process the card itself here; it returns a
+//     `redirect_url` and the customer enters their card details on
+//     MarzPay's own hosted gateway. This server never sees card details,
+//     so there's nothing PCI-sensitive to store or handle.
+//   - Card collections credit MarzPay's separate `card_balance` wallet on
+//     MarzPay's side, but as far as this app's own Firestore balance goes,
+//     it's still money the user deposited — the webhook below credits
+//     `balance.main` for this the same way it does for a mobile money
+//     deposit, keyed off `type === "deposit"` (see webhook handler).
+// We record `type: "deposit"` (not a separate type) so this flows through
+// every existing history query/listener in wallet.html for free, and add
+// `method: "card"` purely so the UI can label it correctly.
+app.post("/api/deposit-card", requireAuth, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const amt = Number(amount);
+
+    if (!isValidAmount(amt)) {
+      return res.status(400).json({ success: false, error: "Enter a valid amount (min 500 UGX)." });
+    }
+    if (amt > 10000000) {
+      return res.status(400).json({ success: false, error: "Card payments are limited to a maximum of UGX 10,000,000." });
+    }
+
+    const txRef = db.collection("transactions").doc();
+    const reference = randomUUID(); // MarzPay requires a valid UUID v4 reference
+
+    await txRef.set({
+      uid: req.uid,
+      type: "deposit",
+      method: "card",
+      amount: amt,
+      status: "pending",
+      reference,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    let marzRes;
+    try {
+      marzRes = await fetch(`${MARZPAY_BASE_URL}/collect-money`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": marzAuthHeader()
+        },
+        body: JSON.stringify({
+          amount: amt,
+          method: "card",
+          reference,
+          country: "UG",
+          description: "HMK Stocks Wallet card deposit",
+          callback_url: "https://marzpay.onrender.com/webhook/marzpay"
+        })
+      });
+      console.log(`MarzPay card collect-money response status: ${marzRes.status}, reference=${reference}`);
+    } catch (fetchErr) {
+      console.error("Network error calling MarzPay collect-money (card):", fetchErr.message);
+      await txRef.update({
+        status: "failed",
+        failReason: "Network error reaching MarzPay: " + fetchErr.message,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      return res.status(502).json({ success: false, error: "Could not reach MarzPay. Check MARZPAY_BASE_URL env var and Render logs." });
+    }
+
+    const marzData = await marzRes.json().catch(() => ({}));
+
+    if (!marzRes.ok || marzData.status !== "success" || !marzData.data || !marzData.data.redirect_url) {
+      console.error("MarzPay card collect-money failed:", marzRes.status, JSON.stringify(marzData));
+      await txRef.update({
+        status: "failed",
+        failReason: marzData.message || `MarzPay error (HTTP ${marzRes.status})`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      return res.status(400).json({
+        success: false,
+        error: marzData.message || "MarzPay could not start this card payment. Make sure Card Payments is enabled for this business."
+      });
+    }
+
+    await txRef.update({
+      marzpayResponse: marzData,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      reference,
+      redirect_url: marzData.data.redirect_url,
+      message: "Redirecting to MarzPay's secure card gateway."
+    });
+  } catch (err) {
+    console.error("Card deposit error:", err);
+    res.status(500).json({ success: false, error: "Server error while processing card deposit." });
+  }
+});
+
 // ---------- WITHDRAW ----------
 // Balance is deducted immediately (reserved) so a user can't withdraw the same
 // funds twice while a payout is in flight. If MarzPay ultimately fails the
@@ -592,6 +694,11 @@ app.get("/api/transaction/:reference/status", requireAuth, async (req, res) => {
 // ---------- MARZPAY WEBHOOK ----------
 // MarzPay calls this URL when a deposit or withdrawal finishes processing.
 // This is the ONLY place a user's balance is credited for a deposit.
+// Card deposits (from /api/deposit-card) land here too, unmodified — they're
+// stored with type: "deposit" (see /api/deposit-card), so the success branch
+// below credits balance.main for them exactly like a mobile money deposit.
+// Card webhook payloads just have provider: "card payments" and
+// phone_number: null, neither of which this handler reads.
 //
 // Signature verification (per MarzPay's docs: wallet.wearemarz.com/documentation/webhooks):
 //   - Only active if MARZPAY_WEBHOOK_SIGNING_SECRET is set. MarzPay's webhook
